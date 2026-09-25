@@ -1,0 +1,26 @@
+# Business Entity Resolution Pipeline - Pinned Dependencies
+# Optimized for 16GB RAM, 10-core Intel i5-13450HX
+
+# Data processing - columnar, streaming, memory-efficient
+polars==1.30.0
+
+# Fast fuzzy string matching - C-extension with OpenMP parallelism
+rapidfuzz==3.12.2
+
+# Gradient-boosted decision tree classifier
+lightgbm==4.6.0
+
+# Sparse TF-IDF vectorizer & cosine similarity
+scikit-learn==1.6.1
+
+# Efficient sparse matrix operations
+scipy==1.15.2
+
+# Array operations (dependency but also used directly)
+numpy==2.2.5
+
+# Progress bars for long-running operations
+tqdm==4.67.1
+
+# Joblib for parallel processing
+joblib==1.4.2
