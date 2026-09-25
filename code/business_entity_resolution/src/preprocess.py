@@ -43,13 +43,66 @@ _RE_ADDR_ABBREVS = {
 }
 
 
+import unicodedata
+from indic_transliteration import sanscript
+from indic_transliteration.sanscript import transliterate
+
+
+def detect_and_transliterate_indic(text: str) -> str:
+    """
+    Ultra-fast rule-based Indic script transliteration to Romanized Latin
+    plus Unicode NFKD accent normalization for European/French text.
+    Supports Devanagari, Tamil, Telugu, Bengali, Gujarati, Kannada,
+    Malayalam, Gurmukhi, and Oriya scripts.
+    """
+    if not text:
+        return ""
+    
+    # Check if text contains non-ASCII characters
+    if not any(ord(c) > 127 for c in text):
+        return text
+
+    script_counts = {}
+    for c in text:
+        cp = ord(c)
+        if 0x0900 <= cp <= 0x097F:
+            script_counts[sanscript.DEVANAGARI] = script_counts.get(sanscript.DEVANAGARI, 0) + 1
+        elif 0x0980 <= cp <= 0x09FF:
+            script_counts[sanscript.BENGALI] = script_counts.get(sanscript.BENGALI, 0) + 1
+        elif 0x0A00 <= cp <= 0x0A7F:
+            script_counts[sanscript.GURMUKHI] = script_counts.get(sanscript.GURMUKHI, 0) + 1
+        elif 0x0A80 <= cp <= 0x0AFF:
+            script_counts[sanscript.GUJARATI] = script_counts.get(sanscript.GUJARATI, 0) + 1
+        elif 0x0B00 <= cp <= 0x0B7F:
+            script_counts[sanscript.ORIYA] = script_counts.get(sanscript.ORIYA, 0) + 1
+        elif 0x0B80 <= cp <= 0x0BFF:
+            script_counts[sanscript.TAMIL] = script_counts.get(sanscript.TAMIL, 0) + 1
+        elif 0x0C00 <= cp <= 0x0C7F:
+            script_counts[sanscript.TELUGU] = script_counts.get(sanscript.TELUGU, 0) + 1
+        elif 0x0C80 <= cp <= 0x0CFF:
+            script_counts[sanscript.KANNADA] = script_counts.get(sanscript.KANNADA, 0) + 1
+        elif 0x0D00 <= cp <= 0x0D7F:
+            script_counts[sanscript.MALAYALAM] = script_counts.get(sanscript.MALAYALAM, 0) + 1
+
+    if not script_counts:
+        # Non-Indic unicode (e.g. French accents) -> NFKD normalization
+        return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+
+    try:
+        primary_script = max(script_counts, key=script_counts.get)
+        res = transliterate(text, primary_script, sanscript.ITRANS)
+        return unicodedata.normalize('NFKD', res).encode('ascii', 'ignore').decode('ascii')
+    except Exception:
+        return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+
+
 def normalize_text(text: Optional[str]) -> str:
     """
     Core text normalization function applied to both names and addresses.
 
     Steps:
     1. Lowercase
-    2. Remove non-ASCII characters (handles garbled Unicode from Indian scripts)
+    2. Transliterate Indic scripts to Romanized Latin / strip accents (NFKD)
     3. Strip punctuation (keep alphanumeric + spaces)
     4. Collapse whitespace
     5. Strip leading/trailing whitespace
@@ -63,11 +116,11 @@ def normalize_text(text: Optional[str]) -> str:
     if text is None or (isinstance(text, float)):
         return ""
 
-    # Step 1: Lowercase
+    # Step 1: Convert to string & lowercase
     text = str(text).lower()
 
-    # Step 2: Remove non-ASCII (handles garbled Devanagari/non-Latin scripts)
-    text = text.encode('ascii', errors='ignore').decode('ascii')
+    # Step 2: Transliterate Indic scripts to Romanized Latin + strip diacritics
+    text = detect_and_transliterate_indic(text)
 
     # Step 3: Strip punctuation, keep alphanumeric and spaces
     text = _RE_NON_ALNUM.sub(' ', text)
