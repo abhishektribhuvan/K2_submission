@@ -205,15 +205,30 @@ def inference_pipeline(batch_size: int = INFERENCE_BATCH_SIZE) -> None:
             vetoes = (feat_arr[:, 24] == 1.0)
             n_vetoed = int(vetoes.sum())
             print(f"[INFER]   Predictions: min={probs.min():.4f}, max={probs.max():.4f}, mean={probs.mean():.4f}")
-            print(f"[INFER]   Precision vetoes applied: {n_vetoed:,} pairs rejected")
-
+            # Group candidate predictions per S1 entity for Option A adaptive cluster admission
+            q_candidate_scores = {}
             for s1_id, cid, prob, veto in zip(pair_s1_ids, pair_cand_ids, probs, vetoes):
-                # Enforce threshold AND precision veto
-                if not veto and prob >= threshold:
-                    batch_matches[s1_id].append(cid)
+                q_candidate_scores.setdefault(s1_id, []).append((cid, prob, veto))
+
+            n_veto_rejected = 0
+            for s1_id, cand_scores in q_candidate_scores.items():
+                max_prob = max((p for _, p, _ in cand_scores), default=0.0)
+                # If high-confidence anchor exists (max_prob >= 0.88), admit companion cluster records down to 0.70
+                # Otherwise require calibrated threshold (0.75)
+                adaptive_cutoff = 0.70 if max_prob >= 0.88 else threshold
+
+                for cid, prob, veto in cand_scores:
+                    # Soft Veto: Reject if veto is flagged UNLESS model is highly confident (>= 0.92)
+                    if veto and prob < 0.92:
+                        n_veto_rejected += 1
+                        continue
+                    if prob >= adaptive_cutoff:
+                        batch_matches[s1_id].append(cid)
+
+            print(f"[INFER]   Precision vetoes applied: {n_veto_rejected:,} pairs rejected (softened for high confidence)")
 
         n_matched = sum(1 for v in batch_matches.values() if len(v) > 0)
-        print(f"[INFER]   Matched {n_matched:,}/{len(batch_ids):,} entities above threshold {threshold:.3f}")
+        print(f"[INFER]   Matched {n_matched:,}/{len(batch_ids):,} entities with Option A (adaptive threshold <= {threshold:.3f})")
 
         # Append candidate pairs to TSV
         with open(str(CANDIDATE_PAIRS_FILE), 'a', encoding='utf-8') as f_cand:
