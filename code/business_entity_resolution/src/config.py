@@ -55,7 +55,7 @@ POLARS_BATCH_SIZE = 200_000
 INFERENCE_BATCH_SIZE = 100_000
 
 # Number of top candidates to retrieve per Source 1 entity during blocking
-TOP_K_CANDIDATES = 15
+TOP_K_CANDIDATES = 25
 
 # TF-IDF vectorizer batch size for fitting (to avoid OOM on 10M+ rows)
 TFIDF_FIT_BATCH_SIZE = 500_000
@@ -77,15 +77,16 @@ BUSINESS_SUFFIXES = [
     # Generic
     r'\bgroup\b', r'\bholdings?\b', r'\benterprise[s]?\b',
     r'\bservices?\b', r'\bsolutions?\b', r'\btechnolog(?:y|ies)\b',
-    r'\binternational\b', r'\bglobal\b',
 ]
 
 # Common address abbreviations to normalize (language-agnostic)
+# Note: 'st' (Saint vs Street) and 'fl' (Floor vs Florida) are handled
+# context-sensitively in preprocess.py to prevent corrupting city/state names.
 ADDRESS_ABBREVIATIONS = {
-    'rd': 'road', 'st': 'street', 'ave': 'avenue', 'blvd': 'boulevard',
+    'rd': 'road', 'ave': 'avenue', 'blvd': 'boulevard',
     'dr': 'drive', 'ln': 'lane', 'ct': 'court', 'pl': 'place',
     'cir': 'circle', 'hwy': 'highway', 'pkwy': 'parkway',
-    'apt': 'apartment', 'ste': 'suite', 'fl': 'floor',
+    'apt': 'apartment', 'ste': 'suite',
     'bldg': 'building', 'dept': 'department', 'rm': 'room',
     'n': 'north', 's': 'south', 'e': 'east', 'w': 'west',
     'ne': 'northeast', 'nw': 'northwest', 'se': 'southeast', 'sw': 'southwest',
@@ -97,23 +98,29 @@ ADDRESS_ABBREVIATIONS = {
 # ============================================================================
 # TF-IDF / BLOCKING CONFIGURATION
 # ============================================================================
-# Analyzer type for TF-IDF vectorizer ('word' for fast word-level tokens)
+# Analyzer type for TF-IDF vectorizer ('word' for fast token-level blocking)
 ANALYZER = 'word'
 
-# Word n-gram range for TF-IDF vectorizer
+# Word n-gram range for TF-IDF vectorizer (unigrams + bigrams)
 NGRAM_RANGE = (1, 2)
 
-# Maximum number of features for TF-IDF (controls memory)
-MAX_FEATURES = 500_000
+# Maximum number of features for TF-IDF (controls memory and dot-product dimensions)
+MAX_FEATURES = 80_000
 
 # Minimum document frequency for TF-IDF terms
-MIN_DF = 2
+MIN_DF = 3
 
-# Maximum document frequency ratio for TF-IDF terms
-MAX_DF = 0.25
+# Maximum document frequency ratio for TF-IDF terms (eliminates non-discriminative background words)
+MAX_DF = 0.015
 
 # Sublinear TF scaling (log-normalized term frequencies, similar to BM25)
 SUBLINEAR_TF = True
+
+# ============================================================================
+# DETERMINISTIC PRECISION VETOES (F0.5 Precision Protection)
+# ============================================================================
+MIN_NAME_SIMILARITY_VETO = 0.35  # Veto if clean names are completely disjoint
+ENFORCE_STREET_NUM_VETO = True   # Veto if both have conflicting street numbers
 
 # ============================================================================
 # LIGHTGBM HYPERPARAMETERS
@@ -122,11 +129,11 @@ LGBM_PARAMS = {
     'objective': 'binary',
     'metric': 'binary_logloss',
     'boosting_type': 'gbdt',
-    'num_leaves': 63,
-    'max_depth': 8,
-    'learning_rate': 0.05,
-    'n_estimators': 500,
-    'min_child_samples': 50,
+    'num_leaves': 127,
+    'max_depth': 10,
+    'learning_rate': 0.04,
+    'n_estimators': 1500,
+    'min_child_samples': 30,
     'subsample': 0.8,
     'colsample_bytree': 0.8,
     'reg_alpha': 0.1,
@@ -143,7 +150,7 @@ LGBM_PARAMS = {
 # Range of thresholds to evaluate for F0.5 optimization
 THRESHOLD_MIN = 0.50
 THRESHOLD_MAX = 0.95
-THRESHOLD_STEP = 0.01
+THRESHOLD_STEP = 0.005
 
 # ============================================================================
 # TRAIN/VALIDATION SPLIT

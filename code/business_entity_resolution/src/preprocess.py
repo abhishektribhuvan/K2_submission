@@ -42,6 +42,16 @@ _RE_ADDR_ABBREVS = {
     for abbr, full in ADDRESS_ABBREVIATIONS.items()
 }
 
+# Context-aware regex for 'st' (Saint vs Street)
+_RE_SAINT = re.compile(
+    r'\b(?:st|saint)\b(?=\s+(?:louis|petersburg|paul|xavier|cloud|joseph|charles|john|augustine|thomas|mary|george|anthony|claire|denis|germain|laurent|maurice|pierre|etienne)\b)',
+    re.IGNORECASE
+)
+_RE_STREET = re.compile(
+    r'\bst\b(?!\s+(?:louis|petersburg|paul|xavier|cloud|joseph|charles|john|augustine|thomas|mary|george|anthony|claire|denis|germain|laurent|maurice|pierre|etienne)\b)',
+    re.IGNORECASE
+)
+
 
 import unicodedata
 from indic_transliteration import sanscript
@@ -54,6 +64,7 @@ def detect_and_transliterate_indic(text: str) -> str:
     plus Unicode NFKD accent normalization for European/French text.
     Supports Devanagari, Tamil, Telugu, Bengali, Gujarati, Kannada,
     Malayalam, Gurmukhi, and Oriya scripts.
+    Guarantees lowercase output so ITRANS uppercase phonetic markers are not lost.
     """
     if not text:
         return ""
@@ -86,14 +97,15 @@ def detect_and_transliterate_indic(text: str) -> str:
 
     if not script_counts:
         # Non-Indic unicode (e.g. French accents) -> NFKD normalization
-        return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+        return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii').lower()
 
     try:
         primary_script = max(script_counts, key=script_counts.get)
         res = transliterate(text, primary_script, sanscript.ITRANS)
-        return unicodedata.normalize('NFKD', res).encode('ascii', 'ignore').decode('ascii')
+        res = unicodedata.normalize('NFKD', res).encode('ascii', 'ignore').decode('ascii')
+        return res.lower()
     except Exception:
-        return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
+        return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii').lower()
 
 
 def normalize_text(text: Optional[str]) -> str:
@@ -101,8 +113,8 @@ def normalize_text(text: Optional[str]) -> str:
     Core text normalization function applied to both names and addresses.
 
     Steps:
-    1. Lowercase
-    2. Transliterate Indic scripts to Romanized Latin / strip accents (NFKD)
+    1. Transliterate Indic scripts to Romanized Latin / strip accents (NFKD)
+    2. Lowercase (ensures ITRANS uppercase phonetic markers like T, N, Sh become lowercase)
     3. Strip punctuation (keep alphanumeric + spaces)
     4. Collapse whitespace
     5. Strip leading/trailing whitespace
@@ -116,19 +128,22 @@ def normalize_text(text: Optional[str]) -> str:
     if text is None or (isinstance(text, float)):
         return ""
 
-    # Step 1: Convert to string & lowercase
-    text = str(text).lower()
+    # Step 1: Convert to string
+    text = str(text)
 
     # Step 2: Transliterate Indic scripts to Romanized Latin + strip diacritics
     text = detect_and_transliterate_indic(text)
 
-    # Step 3: Strip punctuation, keep alphanumeric and spaces
+    # Step 3: Lowercase so ITRANS output markers are valid lowercase letters
+    text = text.lower()
+
+    # Step 4: Strip punctuation, keep alphanumeric and spaces
     text = _RE_NON_ALNUM.sub(' ', text)
 
-    # Step 4: Collapse multiple spaces
+    # Step 5: Collapse multiple spaces
     text = _RE_MULTI_SPACE.sub(' ', text)
 
-    # Step 5: Strip edges
+    # Step 6: Strip edges
     return text.strip()
 
 
@@ -138,7 +153,9 @@ def normalize_business_name(text: Optional[str]) -> str:
 
     After base normalization, removes common legal suffixes
     (Inc, Corp, Ltd, Pvt, SARL, etc.) to focus on the distinctive
-    business name tokens.
+    business name tokens. If suffix removal strips the entire name
+    (e.g., generic names like 'Global Solutions'), retains the original
+    normalized name as a fallback.
 
     Args:
         text: Raw business name
@@ -151,11 +168,16 @@ def normalize_business_name(text: Optional[str]) -> str:
         return ""
 
     # Remove business legal suffixes
+    clean = text
     for pattern in _RE_SUFFIXES:
-        text = pattern.sub('', text)
+        clean = pattern.sub('', clean)
 
     # Clean up any double spaces created by removal
-    text = _RE_MULTI_SPACE.sub(' ', text).strip()
+    clean = _RE_MULTI_SPACE.sub(' ', clean).strip()
+
+    # Fallback: if stripping left nothing or too few characters, keep original text
+    if len(clean) >= 2:
+        return clean
     return text
 
 
@@ -165,7 +187,8 @@ def normalize_address(text: Optional[str]) -> str:
 
     Expands common address abbreviations (Rd->Road, St->Street, etc.)
     to canonical forms, enabling better fuzzy matching across sources.
-    This is language-agnostic and works for US, Indian, and French addresses.
+    Context-sensitively distinguishes 'St' as Saint (St Louis) vs Street (Main St).
+    Language-agnostic: works for US, Indian, and French addresses.
 
     Args:
         text: Raw business address
@@ -176,6 +199,12 @@ def normalize_address(text: Optional[str]) -> str:
     text = normalize_text(text)
     if not text:
         return ""
+
+    # Context-aware 'st' handling:
+    # 'st' before Saint names -> 'saint'
+    text = _RE_SAINT.sub('saint', text)
+    # other 'st' -> 'street'
+    text = _RE_STREET.sub('street', text)
 
     # Expand address abbreviations
     for pattern, replacement in _RE_ADDR_ABBREVS.items():
@@ -325,6 +354,7 @@ def load_and_preprocess(filepath: str, batch_size: int = POLARS_BATCH_SIZE) -> p
         },
         ignore_errors=True,
     )
+    df = df.rename({col: col.strip() for col in df.columns})
 
     print(f"[PREPROCESS]   Loaded {len(df):,} rows")
 
@@ -384,6 +414,7 @@ def load_ground_truth(filepath: str) -> dict:
         dtypes={"source1_entity_id": pl.Utf8, "matched_entity_ids": pl.Utf8},
         ignore_errors=True,
     )
+    df = df.rename({col: col.strip() for col in df.columns})
 
     gt = {}
     for row in df.iter_rows(named=True):

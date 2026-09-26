@@ -145,6 +145,41 @@ def numeric_overlap(nums1: str, nums2: str) -> Tuple[float, int]:
 
 from rapidfuzz.distance import JaroWinkler
 
+
+def evaluate_precision_veto(
+    s1_name: str,
+    s1_addr: str,
+    s1_addr_nums: str,
+    c_name: str,
+    c_addr: str,
+    c_addr_nums: str,
+    name_sort_sim: float,
+    name_jw_sim: float,
+) -> bool:
+    """
+    Deterministic precision vetoes to eliminate catastrophic false merges.
+    In macro F0.5, a false positive carries a 4x penalty over a false negative.
+    
+    Returns True if the candidate pair MUST BE VETOED (forced to reject).
+    """
+    # Veto 1: Multi-tenant building trap
+    # If clean names share virtually no similarity (< 0.35),
+    # they are different tenants in the same building or street.
+    if max(name_sort_sim, name_jw_sim) < 0.35:
+        return True
+
+    # Veto 2: Franchise trap (same brand/street, but conflicting street numbers)
+    # Only enforce when BOTH entities have non-empty address numerics
+    if s1_addr_nums and c_addr_nums:
+        s1_num_set = set(s1_addr_nums.split())
+        c_num_set = set(c_addr_nums.split())
+        # If both entities have numbers, but share ZERO numbers in common
+        if s1_num_set and c_num_set and not (s1_num_set & c_num_set):
+            return True
+
+    return False
+
+
 def compute_pair_features(
     s1_name: str, s1_addr: str, s1_name_nums: str, s1_addr_nums: str,
     s1_combined: str, s1_country: str,
@@ -153,7 +188,7 @@ def compute_pair_features(
 ) -> List[float]:
     features = []
 
-    # --- NAME FEATURES (7) ---
+    # --- NAME FEATURES (12) ---
     # 1. Token Sort Ratio
     features.append(fuzz.token_sort_ratio(s1_name, c_name) / 100.0)
 
@@ -175,34 +210,69 @@ def compute_pair_features(
     # 7. Exact Clean Name Match flag
     features.append(1.0 if (s1_name and s1_name == c_name) else 0.0)
 
-    # --- ADDRESS FEATURES (5) ---
-    # 8. Address Token Sort Ratio
+    # 8. Name Character 3-gram Cosine Similarity
+    features.append(char_ngram_cosine(s1_name, c_name, n=3))
+
+    # 9. Name Length Ratio
+    l1, l2 = len(s1_name), len(c_name)
+    features.append(min(l1, l2) / max(l1, l2) if max(l1, l2) > 0 else 0.0)
+
+    # 10. Name Prefix Match (first 4 characters)
+    features.append(1.0 if (s1_name and c_name and len(s1_name) >= 4 and len(c_name) >= 4 and s1_name[:4] == c_name[:4]) else 0.0)
+
+    # 11. Name Containment (shorter inside longer)
+    features.append(1.0 if (s1_name and c_name and (s1_name in c_name or c_name in s1_name)) else 0.0)
+
+    # 12. Name Token Count Ratio
+    tc1, tc2 = len(s1_name.split()), len(c_name.split())
+    features.append(min(tc1, tc2) / max(tc1, tc2) if max(tc1, tc2) > 0 else 0.0)
+
+    # --- ADDRESS FEATURES (8) ---
+    # 13. Address Token Sort Ratio
     features.append(fuzz.token_sort_ratio(s1_addr, c_addr) / 100.0)
 
-    # 9. Address Levenshtein Ratio
+    # 14. Address Levenshtein Ratio
     features.append(fuzz.ratio(s1_addr, c_addr) / 100.0)
 
-    # 10. Address Jaccard Token Overlap
+    # 15. Address Jaccard Token Overlap
     features.append(jaccard_token_similarity(s1_addr, c_addr))
 
-    # 11. Address Character 3-gram Cosine Similarity
+    # 16. Address Character 3-gram Cosine Similarity
     features.append(char_ngram_cosine(s1_addr, c_addr, n=3))
 
-    # 12. Address Partial Ratio
+    # 17. Address Partial Ratio
     features.append(fuzz.partial_ratio(s1_addr, c_addr) / 100.0)
 
+    # 18. Address Exact Match flag
+    features.append(1.0 if (s1_addr and s1_addr == c_addr) else 0.0)
+
+    # 19. Address Length Ratio
+    al1, al2 = len(s1_addr), len(c_addr)
+    features.append(min(al1, al2) / max(al1, al2) if max(al1, al2) > 0 else 0.0)
+
+    # 20. Address Containment (shorter inside longer)
+    features.append(1.0 if (s1_addr and c_addr and (s1_addr in c_addr or c_addr in s1_addr)) else 0.0)
+
     # --- NUMERIC FEATURES (2) ---
-    # 13-14. Address numeric overlap (Jaccard + exact match flag)
+    # 21-22. Address numeric overlap (Jaccard + exact match flag)
     addr_num_jaccard, addr_num_exact = numeric_overlap(s1_addr_nums, c_addr_nums)
     features.append(addr_num_jaccard)
     features.append(float(addr_num_exact))
 
     # --- COMBINED FEATURES (2) ---
-    # 15. Combined name+address Levenshtein Ratio
+    # 23. Combined name+address Levenshtein Ratio
     features.append(fuzz.token_sort_ratio(s1_combined, c_combined) / 100.0)
 
-    # 16. Country exact match flag
+    # 24. Country exact match flag
     features.append(1.0 if s1_country == c_country else 0.0)
+
+    # 25. Precision Veto Flag (1.0 if pair violates street number or name disjointness, else 0.0)
+    veto = evaluate_precision_veto(
+        s1_name, s1_addr, s1_addr_nums,
+        c_name, c_addr, c_addr_nums,
+        features[0], features[5]
+    )
+    features.append(1.0 if veto else 0.0)
 
     return features
 
@@ -216,15 +286,24 @@ FEATURE_NAMES = [
     "name_token_set_ratio",
     "name_jaro_winkler",
     "name_exact_match",
+    "name_char_ngram_cosine",
+    "name_length_ratio",
+    "name_prefix_match_4",
+    "name_containment",
+    "name_token_count_ratio",
     "addr_token_sort_ratio",
     "addr_levenshtein_ratio",
     "addr_jaccard_overlap",
     "addr_char_ngram_cosine",
     "addr_partial_ratio",
+    "addr_exact_match",
+    "addr_length_ratio",
+    "addr_containment",
     "addr_numeric_jaccard",
     "addr_numeric_exact_match",
     "combined_token_sort_ratio",
     "country_exact_match",
+    "precision_veto_flag",
 ]
 
 NUM_FEATURES = len(FEATURE_NAMES)

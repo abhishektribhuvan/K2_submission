@@ -21,6 +21,7 @@ from scipy.sparse import vstack as sparse_vstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
 from src.config import (
     ANALYZER,
@@ -53,7 +54,7 @@ class TFIDFBlocker:
     def __init__(self, top_k: int = TOP_K_CANDIDATES):
         self.top_k = top_k
         self.vectorizers: Dict[str, TfidfVectorizer] = {}
-        self.candidate_matrices = {}
+        self.candidate_matrices_T = {}
         self.candidate_ids: Dict[str, List[str]] = {}
 
     def build_index(
@@ -150,11 +151,13 @@ class TFIDFBlocker:
             print(f"[BLOCKING]   TF-IDF matrix shape: {tfidf_matrix.shape}, "
                   f"nnz: {tfidf_matrix.nnz:,}")
 
-            # Prune hyper-frequent feature columns (>5,000 docs) to eliminate dot product bottleneck
+            # Prune hyper-frequent feature columns (>20,000 docs or >1.0% of candidates)
+            # to eliminate dot product memory spikes without discarding city or domain terms
+            prune_threshold = max(20000, int(0.010 * n_candidates))
             col_counts = np.diff(tfidf_matrix.tocsc().indptr)
-            frequent_cols = np.where(col_counts > 5000)[0]
+            frequent_cols = np.where(col_counts > prune_threshold)[0]
             if len(frequent_cols) > 0:
-                print(f"[BLOCKING]   Pruning {len(frequent_cols):,} hyper-frequent features (>5k docs)...")
+                print(f"[BLOCKING]   Pruning {len(frequent_cols):,} hyper-frequent features (>{prune_threshold:,} docs)...")
                 tfidf_csc = tfidf_matrix.tocsc()
                 for col in frequent_cols:
                     start_i = tfidf_csc.indptr[col]
@@ -164,12 +167,13 @@ class TFIDFBlocker:
                 tfidf_matrix = tfidf_csc.tocsr()
                 print(f"[BLOCKING]   Pruned TF-IDF matrix nnz: {tfidf_matrix.nnz:,}")
 
-            # Store the index components
+            # Store pre-transposed CSC matrix directly (m.T on CSR is already CSC format)
+            # with zero-copy and zero memory duplication
             self.vectorizers[country] = vectorizer
-            self.candidate_matrices[country] = tfidf_matrix
+            self.candidate_matrices_T[country] = tfidf_matrix.T
             self.candidate_ids[country] = ids
 
-            del texts
+            del tfidf_matrix, texts
             gc.collect()
 
         print(f"\n[BLOCKING] Index build complete for {len(countries)} countries")
@@ -218,76 +222,95 @@ class TFIDFBlocker:
                 continue
 
             vectorizer = self.vectorizers[country]
-            candidate_matrix = self.candidate_matrices[country]
+            candidate_matrix_T = self.candidate_matrices_T[country]
             candidate_ids = self.candidate_ids[country]
             n_candidates = len(candidate_ids)
 
-            # Use batch_size = 5,000 for high-throughput word token sparse dot product
-            effective_batch = min(batch_size, 5000)
+            # High-performance parallel chunking (6 threads on 10-core CPU)
+            effective_batch = 2000
+            num_workers = 6
 
             print(f"[BLOCKING] Querying {n_queries:,} records for country '{country}' "
                   f"against {n_candidates:,} candidates "
-                  f"(batch_size={effective_batch:,})")
+                  f"(sub_batch={effective_batch:,}, workers={num_workers})")
 
             # Extract query data
             query_texts = country_queries[text_col].to_list()
             query_ids = country_queries[id_col].to_list()
             query_texts = [t if t and str(t).strip() else "unknown" for t in query_texts]
 
-            # Transpose candidate matrix once for efficient sparse dot product
-            candidate_matrix_T = candidate_matrix.T.tocsc()
+            # Vectorize all queries for this country once to eliminate loop transform overhead
+            query_matrix_all = vectorizer.transform(query_texts)
 
-            # Process in sub-batches
-            for i in tqdm(range(0, n_queries, effective_batch),
-                         desc=f"  Blocking ({country})",
-                         total=(n_queries + effective_batch - 1) // effective_batch):
-                batch_end = min(i + effective_batch, n_queries)
-                batch_texts = query_texts[i:batch_end]
-                batch_ids = query_ids[i:batch_end]
+            sub_starts = list(range(0, n_queries, effective_batch))
+            top_k = self.top_k
 
-                # Transform queries (already L2-normalized by vectorizer)
-                query_matrix = vectorizer.transform(batch_texts)
+            def _process_sub_batch(start_idx: int) -> Dict[str, List[str]]:
+                end_idx = min(start_idx + effective_batch, n_queries)
+                sub_ids = query_ids[start_idx:end_idx]
+                sub_query = query_matrix_all[start_idx:end_idx]
 
-                # Sparse dot product: since both matrices are L2-normalized,
-                # dot product = cosine similarity.
-                sim_sparse = (query_matrix @ candidate_matrix_T).tocsr()
+                # Sparse dot product (result is natively a CSR matrix)
+                sim_sparse = sub_query @ candidate_matrix_T
 
-                # Fast SciPy CSR memory slicing using indptr / indices / data
                 indptr = sim_sparse.indptr
                 indices = sim_sparse.indices
                 data = sim_sparse.data
 
-                for j, qid in enumerate(batch_ids):
-                    start_idx = indptr[j]
-                    end_idx = indptr[j + 1]
+                sub_res = {}
+                for j, qid in enumerate(sub_ids):
+                    start_idx_row = indptr[j]
+                    end_idx_row = indptr[j + 1]
 
-                    if start_idx == end_idx:
-                        results[qid] = []
+                    if start_idx_row == end_idx_row:
+                        sub_res[qid] = []
                         continue
 
-                    row_vals = data[start_idx:end_idx]
-                    row_cols = indices[start_idx:end_idx]
+                    row_vals = data[start_idx_row:end_idx_row]
+                    row_cols = indices[start_idx_row:end_idx_row]
 
                     n_elem = len(row_vals)
-                    if n_elem <= self.top_k:
+                    if n_elem <= top_k:
                         top_local = np.argsort(-row_vals)
+                        local_cols = row_cols
+                        local_vals = row_vals
                     else:
-                        top_local = np.argpartition(-row_vals, self.top_k)[:self.top_k]
-                        top_local = top_local[np.argsort(-row_vals[top_local])]
+                        mask = row_vals > 0.08
+                        if np.count_nonzero(mask) >= top_k:
+                            local_vals = row_vals[mask]
+                            local_cols = row_cols[mask]
+                            n_f = len(local_vals)
+                            if n_f <= top_k:
+                                top_local = np.argsort(-local_vals)
+                            else:
+                                top_local = np.argpartition(-local_vals, top_k)[:top_k]
+                                top_local = top_local[np.argsort(-local_vals[top_local])]
+                        else:
+                            top_local = np.argpartition(-row_vals, top_k)[:top_k]
+                            top_local = top_local[np.argsort(-row_vals[top_local])]
+                            local_cols = row_cols
+                            local_vals = row_vals
 
                     top_candidates = []
+                    seen_cids = set()
                     for li in top_local:
-                        if row_vals[li] > 0.0:
-                            cid = candidate_ids[row_cols[li]]
-                            if cid != qid and cid not in top_candidates:
+                        if local_vals[li] > 0.0:
+                            cid = candidate_ids[local_cols[li]]
+                            if cid != qid and cid not in seen_cids:
+                                seen_cids.add(cid)
                                 top_candidates.append(cid)
 
-                    results[qid] = top_candidates
+                    sub_res[qid] = top_candidates
+                return sub_res
 
-                del sim_sparse, query_matrix
-                gc.collect()
+            # Process sub-batches in parallel across 6 worker threads
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                for sub_dict in tqdm(executor.map(_process_sub_batch, sub_starts),
+                                     desc=f"  Blocking ({country})",
+                                     total=len(sub_starts)):
+                    results.update(sub_dict)
 
-            del candidate_matrix_T
+            del query_matrix_all
             gc.collect()
 
         # Ensure every query has an entry (even if empty)
@@ -343,6 +366,10 @@ class TFIDFBlocker:
         n_empty = sum(1 for v in candidates.values() if len(v) == 0)
         print(f"[BLOCKING] Written {len(candidates):,} entries "
               f"({n_with_cands:,} with candidates, {n_empty:,} empty)")
+
+
+# Alias for backwards compatibility
+CountryBlockingIndex = TFIDFBlocker
 
 
 def build_blocking_index(s2_df: pl.DataFrame, s3_df: pl.DataFrame) -> TFIDFBlocker:

@@ -14,12 +14,15 @@ The F0.5 metric heavily penalizes false merges (precision-weighted),
 which aligns with the challenge scoring.
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import gc
 import json
 import numpy as np
 import polars as pl
 import lightgbm as lgb
-from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 from tqdm import tqdm
 
@@ -257,29 +260,14 @@ def threshold_sweep(
     val_s1_ids: List[str],
     val_cand_ids: List[str],
     val_probabilities: np.ndarray,
+    val_vetoes: Optional[np.ndarray] = None,
     threshold_min: float = THRESHOLD_MIN,
     threshold_max: float = THRESHOLD_MAX,
     threshold_step: float = THRESHOLD_STEP,
 ) -> Tuple[float, float]:
     """
-    Sweep decision thresholds to find the one maximizing macro F0.5.
-
-    For each threshold in [threshold_min, threshold_max]:
-    1. Apply threshold to predicted probabilities
-    2. Group predictions by Source 1 entity
-    3. Compute macro F0.5 against validation ground truth
-
-    Args:
-        val_gt: Validation ground truth
-        val_s1_ids: Source 1 entity IDs for each pair
-        val_cand_ids: Candidate entity IDs for each pair
-        val_probabilities: Predicted match probabilities
-        threshold_min: Start of sweep range
-        threshold_max: End of sweep range
-        threshold_step: Step size for sweep
-
-    Returns:
-        (best_threshold, best_f05_score)
+    Sweep decision thresholds to find the one maximizing macro F0.5,
+    accounting for deterministic precision vetoes.
     """
     print(f"\n[TRAIN] Sweeping thresholds from {threshold_min} to {threshold_max} "
           f"(step={threshold_step})...")
@@ -289,12 +277,13 @@ def threshold_sweep(
     best_f05 = 0.0
 
     for threshold in tqdm(thresholds, desc="  Threshold sweep"):
-        # Apply threshold and group predictions
+        # Apply threshold + precision vetoes and group predictions
         predictions = {}
-        for s1_id, cand_id, prob in zip(val_s1_ids, val_cand_ids, val_probabilities):
+        for idx, (s1_id, cand_id, prob) in enumerate(zip(val_s1_ids, val_cand_ids, val_probabilities)):
             if s1_id not in predictions:
                 predictions[s1_id] = set()
-            if prob >= threshold:
+            is_vetoed = val_vetoes[idx] if val_vetoes is not None else False
+            if not is_vetoed and prob >= threshold:
                 predictions[s1_id].add(cand_id)
 
         # Ensure all validation entities are in predictions
@@ -494,7 +483,7 @@ def train_pipeline(
         eval_set=[(val_features, val_labels_arr)],
         eval_metric='binary_logloss',
         callbacks=[
-            lgb.early_stopping(stopping_rounds=30, verbose=True),
+            lgb.early_stopping(stopping_rounds=50, verbose=True),
             lgb.log_evaluation(period=50),
         ],
         feature_name=FEATURE_NAMES,
@@ -515,9 +504,10 @@ def train_pipeline(
     print("\n[TRAIN] Step 8: Threshold sweep on validation set...")
 
     val_probabilities = model.predict_proba(val_features)[:, 1]
+    val_vetoes = (val_features[:, -1] == 1.0) if val_features.shape[1] == len(FEATURE_NAMES) else None
 
     best_threshold, best_f05 = threshold_sweep(
-        val_gt, val_s1_ids, val_cand_ids, val_probabilities
+        val_gt, val_s1_ids, val_cand_ids, val_probabilities, val_vetoes=val_vetoes
     )
 
     # ------------------------------------------------------------------
